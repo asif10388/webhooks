@@ -1,78 +1,77 @@
 import { createPrismaClient } from "./db.js";
 
-const MAX_ATTEMPTS = 5;
-
-interface ClaimedJob {
-  id: string;
-  status: string;
-  createdAt: Date;
-  updatedAt: Date;
-  attempts: number;
-  payload: unknown;
-  eventType: string;
-  nextRetryAt: Date;
-  maxAttempts: number;
-  subscriptionId: string;
-  subscriptionUrl?: string;
-  lastError: string | null;
-  subscriptionSecret?: string;
-}
-
 const databaseUrl =
   process.env["DATABASE_URL"] || "postgresql://postgres:12345678@localhost:5432/webhook_db";
 
 const prisma = createPrismaClient(databaseUrl);
+
+const MAX_ATTEMPTS = 5;
 
 function getBackoffDelay(attempts: number) {
   const delays = [0, 5000, 30000, 120000];
   return delays[Math.min(attempts, delays.length - 1)];
 }
 
-async function handleFailure(job: ClaimedJob) {
-  const attempts = job.attempts + 1;
+async function handleFailure(jobId: string, attempts: number) {
+  const nextAttempts = attempts + 1;
 
-  if (attempts >= MAX_ATTEMPTS) {
+  if (nextAttempts >= MAX_ATTEMPTS) {
     await prisma.webhookEvent.update({
-      where: { id: job.id },
+      where: { id: jobId },
       data: {
         status: "FAILED",
-        attempts,
+        attempts: nextAttempts,
       },
     });
-
     return;
   }
 
-  const delay = getBackoffDelay(attempts);
+  const delay = getBackoffDelay(nextAttempts);
 
   await prisma.webhookEvent.update({
-    where: { id: job.id },
+    where: { id: jobId },
     data: {
       status: "PENDING",
-      attempts,
+      attempts: nextAttempts,
       nextRetryAt: new Date(Date.now() + delay),
     },
   });
 }
 
-async function processJob(job: ClaimedJob) {
+async function processJob(job: any) {
+  const claimed = await prisma.webhookEvent.updateMany({
+    where: {
+      id: job.id,
+      status: "PENDING",
+    },
+    data: {
+      status: "DELIVERING",
+    },
+  });
+
+  if (claimed.count === 0) return;
+
   try {
-    await prisma.webhookEvent.update({
-      where: { id: job.id },
-      data: { status: "DELIVERING" },
+    const sub = await prisma.webhookSubscription.findUnique({
+      where: { id: job.subscriptionId },
     });
 
+    if (!sub) {
+      throw new Error("Subscription not found");
+    }
 
-    const subscribers = await prisma.webhookSubscription.findMany({
-      where: { eventType: job.eventType },
-    });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
 
-    for (const sub of subscribers) {
+    try {
       await fetch(sub.url, {
         method: "POST",
+        signal: controller.signal,
         body: JSON.stringify(job.payload),
         headers: { "Content-Type": "application/json" },
       });
+    } finally {
+      clearTimeout(timeout);
     }
 
     await prisma.webhookEvent.update({
@@ -80,7 +79,7 @@ async function processJob(job: ClaimedJob) {
       data: { status: "DELIVERED" },
     });
   } catch (error) {
-    await handleFailure(job);
+    await handleFailure(job.id, job.attempts);
   }
 }
 
@@ -93,11 +92,12 @@ export function startWorker() {
         status: "PENDING",
         nextRetryAt: { lte: now },
       },
-
       take: 5,
+      orderBy: { createdAt: "asc" },
     });
 
-    for (const job of jobs) await processJob(job)
-    
+    for (const job of jobs) {
+      await processJob(job);
+    }
   }, 2000);
 }

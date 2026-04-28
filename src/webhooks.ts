@@ -1,6 +1,6 @@
 import { randomBytes } from "crypto";
-import { JobStatus } from "./types.js";
 import { createPrismaClient } from "./db.js";
+import { JobStatus } from "./types.js";
 
 type EmitPayload = Record<string, any>;
 
@@ -18,7 +18,7 @@ export function createWebhooks() {
           eventType: event,
         },
       },
-      update: {}, // no-op
+      update: {},
       create: {
         eventType: event,
         url,

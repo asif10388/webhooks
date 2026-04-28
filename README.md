@@ -1,92 +1,102 @@
 # Webhook Delivery Library
 
-A lightweight TypeScript library for reliably delivering webhook events to registered subscribers.
-
-Designed for simplicity, durability, and clear delivery guarantees.
+A lightweight TypeScript library for reliably delivering webhook events to registered subscribers. Designed for simplicity, durability, and clear delivery guarantees.
 
 ---
 
-## ✨ Features
+## Features
 
-- Non-blocking event emission
-- Persistent delivery queue (SQLite via Prisma)
-- At-least-once delivery guarantee
-- Automatic retries with backoff
-- Background worker for async processing
-- Idempotent subscription registration
+- **Non-blocking emission** — `emit()` returns immediately; HTTP delivery happens in the background
+- **Durable queue** — delivery jobs are persisted in the database before `emit()` returns
+- **At-least-once delivery** — jobs survive server restarts and are retried after crashes
+- **Automatic retries** — exponential backoff on failed deliveries
+- **In-process worker** — no separate process or infrastructure required
+- **Idempotent registration** — re-registering the same `(eventType, url)` pair is safe
 
 ---
 
-## 📦 Installation
+## Getting Started
+
+### 1. Install dependencies and run migrations
 
 ```bash
 npm install
 npx prisma migrate dev
-
 ```
-```bash
+
+### 2. Use the library
+
+```ts
 import { createWebhooks } from "./lib/webhooks";
-import { startWorker } from "./worker/worker";
 
 const webhooks = createWebhooks();
 
 // Register a subscriber
 await webhooks.register("order.created", "http://localhost:4000/hook");
 
-// Emit an event
+// Emit an event — returns immediately
 await webhooks.emit("order.created", { orderId: 123 });
-
-// Start background worker
-startWorker();
 ```
 
-Run the example:
+### 3. Run the example
 
+```bash
 npm run dev
+```
 
 This will:
 
-Start an Express server on http://localhost:4000
-Register a webhook subscriber
-Emit an event
-Deliver the webhook via the worker
+1. Start an Express server on `http://localhost:4000`
+2. Register a webhook subscriber
+3. Emit an event
+4. Deliver the webhook via the background worker
 
-You should see:
+Expected output:
 
+```
 Received webhook: { orderId: 123 }
+```
 
-1. Register
+---
 
-Stores a subscriber URL for a given event.
+## How It Works
 
-2. Emit
-Finds all subscribers for the event
-Creates delivery jobs in the database
-Returns immediately (non-blocking)
+### `register(eventType, url)`
 
-3. Worker
-Polls pending jobs
-Sends HTTP POST requests to subscribers
-Retries failed deliveries with backoff
+Stores a subscriber URL for a given event type. Idempotent — calling it again with the same arguments reactivates the subscription without creating a duplicate.
 
-Delivery Guarantees
+### `emit(eventType, payload)`
 
-This system provides:
+1. Finds all active subscribers for the event type
+2. Creates one delivery job per subscriber in the database
+3. Returns immediately — no HTTP calls are made at this point
 
-At-least-once delivery
-Webhooks may be delivered more than once but will not be silently lost.
-Durability
-Jobs are persisted in the database before delivery, ensuring they survive server restarts.
-Retry mechanism
-Failed deliveries are retried with exponential backoff.
-Non-blocking emit
-Slow or failing subscribers do not affect the caller.
+### Worker
 
-This implementation uses a polling-based worker to process jobs.
+Runs in the background on a configurable poll interval:
 
-With more time, I would:
+1. Claims a batch of pending jobs atomically (prevents double-delivery across instances)
+2. Sends an HTTP `POST` to each subscriber URL concurrently
+3. Marks successful deliveries as `DELIVERED`
+4. Retries failed deliveries with exponential backoff
+5. Marks jobs as `FAILED` after the maximum number of attempts is exhausted
 
-Replace polling with an event-driven queue (e.g., Redis + BullMQ or database notifications)
-Improve concurrency handling across multiple workers
-Add deduplication and stronger idempotency guarantees for delivery
-Introduce monitoring and observability (metrics, logs, alerts)
+---
+
+## Delivery Guarantees
+
+| Guarantee | Detail |
+|---|---|
+| **At-least-once** | Webhooks may be delivered more than once but will never be silently lost |
+| **Durability** | Jobs are written to the database before `emit()` returns — survives restarts |
+| **Retry with backoff** | Failed deliveries are retried at 30 s → 5 min → 30 min → 2 h intervals |
+| **Non-blocking** | Slow or failing subscribers have no impact on the `emit()` caller |
+
+---
+
+## Future Improvements
+
+- Replace polling with an event-driven queue (e.g., Redis + BullMQ or PostgreSQL `LISTEN/NOTIFY`)
+- Stronger idempotency guarantees and deduplication on the subscriber side
+- Concurrency safety across multiple worker instances
+- Monitoring and observability (delivery metrics, failure alerts, a status dashboard)
